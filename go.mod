@@ -1,4 +1,4 @@
-module github.com/gden173/geotiff
+module github.com/rp2709/geotiff
 
 go 1.26.0
 
