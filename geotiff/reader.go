@@ -622,23 +622,32 @@ func (g *GeoTIFF) Bounds() (*CornerCoordinates, error) {
 	default:
 		return nil, errors.New("unrecognized value for tiepoint")
 	}
+
+	i := tiePointValues[0]
+	j := tiePointValues[1]
+	x := tiePointValues[3]
+	y := tiePointValues[4]
+
 	cc := CornerCoordinates{}
-	if tiePointValues[0] == 0 && tiePointValues[1] == 0 {
-		cc.UpperLeft = Point{Lon: tiePointValues[3], Lat: tiePointValues[4]}
-		cc.LowerLeft = Point{Lon: cc.UpperLeft.Lon, Lat: cc.UpperLeft.Lat - float64(g.imageLength)*g.PixelScaleY}
-		cc.LowerRight = Point{Lon: cc.UpperLeft.Lon + float64(g.imageWidth)*g.PixelScaleX, Lat: cc.LowerLeft.Lat}
-		cc.UpperRight = Point{Lon: cc.LowerRight.Lon, Lat: cc.UpperLeft.Lat}
-	} else {
-		cc.UpperLeft = Point{
-			Lon: tiePointValues[3] - float64(tiePointValues[0])*g.PixelScaleX,
-			Lat: tiePointValues[4] + float64(tiePointValues[1])*g.PixelScaleY,
-		}
-		cc.LowerRight = Point{
-			Lon: tiePointValues[3] + float64(tiePointValues[0])*g.PixelScaleX,
-			Lat: tiePointValues[4] - float64(tiePointValues[1])*g.PixelScaleY,
-		}
-		cc.LowerLeft = Point{Lon: cc.LowerLeft.Lon, Lat: cc.LowerRight.Lat}
-		cc.UpperRight = Point{Lon: cc.LowerRight.Lon, Lat: cc.UpperLeft.Lat}
+
+	cc.UpperLeft = Point{
+		Lon: x - i*g.PixelScaleX,
+		Lat: y + j*g.PixelScaleY,
+	}
+
+	cc.LowerRight = Point{
+		Lon: x + (float64(g.imageWidth)-i)*g.PixelScaleX,
+		Lat: y - (float64(g.imageLength)-j)*g.PixelScaleY,
+	}
+
+	cc.LowerLeft = Point{
+		Lon: cc.UpperLeft.Lon,
+		Lat: cc.LowerRight.Lat,
+	}
+
+	cc.UpperRight = Point{
+		Lon: cc.LowerRight.Lon,
+		Lat: cc.UpperLeft.Lat,
 	}
 	return &cc, nil
 }
