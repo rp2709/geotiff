@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/gden173/geotiff/geotiff"
+	"github.com/rp2709/geotiff/geotiff"
 )
 
 func main() {
