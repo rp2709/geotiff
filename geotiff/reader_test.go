@@ -953,3 +953,24 @@ func Test_ReadStripData_LongDims(t *testing.T) {
 		t.Errorf("strips[2][7]: got %f, want 24.0", strips[2][7])
 	}
 }
+
+func Test_ReadSwissAlti3d(t *testing.T) {
+	file, err := os.Open("./testdata/swissalti3d.tif")
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	var data *GeoTIFF
+	data, err = Read(file)
+	if err != nil {
+		panic(err)
+	}
+
+	value, err := data.AtCoord(2501000, 1121000, false)
+	if err != nil {
+		panic(err)
+	}
+	if math.Abs(float64(value)-372.14145) > 0.0001 {
+		t.Errorf("Expected 372.145, got %f", value)
+	}
+}

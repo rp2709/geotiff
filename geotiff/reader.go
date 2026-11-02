@@ -1,349 +1,464 @@
+// Package geotiff implements a deliberately small, single-file GeoTIFF reader.
+//
+// Supported raster layout:
+//   - classic TIFF (not BigTIFF)
+//   - one sample per pixel
+//   - 32-bit IEEE floating-point samples
+//   - uncompressed data, without a predictor
+//   - top-left image orientation
+//   - tiled and stripped storage
+//   - ModelTiepoint + ModelPixelScale, or ModelTransformation georeferencing
+//
+// Unsupported layouts are rejected instead of being silently interpreted as
+// Float32 data. Coordinates passed to AtCoord are in the raster's model
+// coordinate reference system; this package does not perform CRS conversion.
 package geotiff
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 )
 
-// head contains the tiff file header
-//
-// Per the TIFF 6.0 Specification (p.13)
-//
-// A TIFF file begins with an 8-byte image file header that points to an image
-// file directory (IFD). An image file directory contains information about the
-// image, as well as pointers to the actual image data.
+// head contains the classic TIFF file header.
 type head struct {
-	// Bytes 0-1
-	//
-	// The byte order used within the file
-	byteOrder binary.ByteOrder
-
-	// Bytes 2-3
-	//
-	// An arbitrary but carefully chosen number (42) that further identifies the file as a TIFF file.
-	// The byte order depends on the value of Bytes 0-1.
+	byteOrder     binary.ByteOrder
 	tIFIdentifier uint16
-
-	// Bytes 4-7
-	//
-	// The offset (in bytes) of the first IFD
 	iFDByteOffset uint32
 }
 
-// iFDEntry contains the image file directory (IFD) entries.
-//
-// Per the TIFF 6.0 Specification (p.14)
-//
-// An Image File Directory (IFD) consists of a 2-byte count of the number of
-// directory entries (i.e., the number of fields), followed by a sequence of
-// 12-byte field entries, followed by a 4-byte offset of the next IFD (or 0 if
-// none). (Do not forget to write the 4 bytes of 0 after the last IFD.) There
-// must be at least 1 IFD in a TIFF file and each IFD must have at least one
-// entry.
+// iFDEntry is one 12-byte classic TIFF directory entry.
 type iFDEntry struct {
-	// Bytes 0-1
-	//
-	// The Tag that identifies the field.
-	Tag Tag
-
-	// Bytes 2-3
-	//
-	//The field FType.
-	FType fieldType
-
-	//  Bytes 4-7
-	//
-	// The number of values, Count of the indicated Type.
-	Count uint32
-
-	// Bytes 8-11
-	//
-	// The Value Offset, the file offset (in bytes) of the Value for
-	// the field. The Value is expected to begin on a word boundary; the
-	// corresponding Value Offset will thus be an even number. This file offset
-	// may point anywhere in the file, even after the image data.
+	Tag         Tag
+	FType       fieldType
+	Count       uint32
 	ValueOffset uint32
 }
 
-func (ifd *iFDEntry) totalBytes() uint32 {
-	return ifd.Count * ifd.FType.bytes()
+func (ifd *iFDEntry) totalBytes() uint64 {
+	return uint64(ifd.Count) * ifd.FType.bytes()
 }
 
-// value reads the directory value
+// value reads and decodes the value associated with an IFD entry. For inline
+// values, ValueOffset is the file position of the four-byte value slot.
 func (ifd *iFDEntry) value(r io.ReadSeeker, byteOrder binary.ByteOrder) (*tagData, error) {
-	t := tagData{
-		fType:  ifd.FType,
-		length: ifd.Count,
+	size := ifd.totalBytes()
+	if size == 0 {
+		return nil, fmt.Errorf("unsupported TIFF field type %d for tag %s", ifd.FType, ifd.Tag)
 	}
-	offset := int64(ifd.ValueOffset)
-	if _, err := r.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
+	if size > uint64(int(^uint(0)>>1)) {
+		return nil, fmt.Errorf("value for tag %s is too large", ifd.Tag)
 	}
-	switch ifd.FType {
-	case BYTE:
-		t.byteData = make([]uint8, ifd.Count)
-		if err := binary.Read(r, byteOrder, &t.byteData); err != nil {
-			return nil, err
-		}
-	case ASCII:
-		p := make([]uint8, ifd.Count)
-		if err := binary.Read(r, byteOrder, p); err != nil {
-			return nil, err
-		}
-		t.asciiData = string(p)
-	case SHORT:
-		t.shortData = make([]uint16, ifd.Count)
-		if err := binary.Read(r, byteOrder, &t.shortData); err != nil {
-			return nil, err
-		}
-	case LONG:
-		t.longData = make([]uint32, ifd.Count)
-		if err := binary.Read(r, byteOrder, &t.longData); err != nil {
-			return nil, err
-		}
-	case FLOAT:
-		t.floatData = make([]float32, ifd.Count)
-		if err := binary.Read(r, byteOrder, t.floatData); err != nil {
-			return nil, err
-		}
-	case DOUBLE:
-		t.doubleData = make([]float64, ifd.Count)
-		if err := binary.Read(r, byteOrder, t.doubleData); err != nil {
-			return nil, err
-		}
+	if _, err := r.Seek(int64(ifd.ValueOffset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek to value for tag %s: %w", ifd.Tag, err)
 	}
-	return &t, nil
+	raw := make([]byte, int(size))
+	if _, err := io.ReadFull(r, raw); err != nil {
+		return nil, fmt.Errorf("read value for tag %s: %w", ifd.Tag, err)
+	}
+	return decodeTagData(ifd.FType, ifd.Count, raw, byteOrder)
 }
 
-var errByteOrder = errors.New("could not parse tiff header byte order")
-
-// readHeader reads the header of a GeoTIFF file
-func readHeader(r io.Reader) (head, error) {
-	var fileHeader head
-
-	// Byte Order
-	var byteOrder uint16
-	err := binary.Read(r, binary.BigEndian, &byteOrder)
-	if err != nil {
-		return fileHeader, fmt.Errorf("%w: %s", errByteOrder, err)
-	}
-
-	switch byteOrder {
-	case littleEndian:
-		fileHeader.byteOrder = binary.LittleEndian
-	case bigEndian:
-		fileHeader.byteOrder = binary.BigEndian
-	default:
-		return fileHeader, errByteOrder
-	}
-
-	// Identifier
-	err = binary.Read(r, fileHeader.byteOrder, &fileHeader.tIFIdentifier)
-	if err != nil {
-		return fileHeader, fmt.Errorf("err: failed to read tiff header: %w", err)
-	}
-
-	if fileHeader.tIFIdentifier != tiffIdentifier {
-		return fileHeader, fmt.Errorf("invalid tiff file identifier: expected %d got %d",
-			tiffIdentifier, fileHeader.tIFIdentifier)
-	}
-
-	// Offset
-	err = binary.Read(r, fileHeader.byteOrder, &fileHeader.iFDByteOffset)
-	if err != nil {
-		return fileHeader, fmt.Errorf("failed to read IFD byte offset: %w", err)
-	}
-	return fileHeader, nil
-}
-
-// tagData holds the tag data for each tag
-// is supposed to act similar to a union
-// where only one data field is used at any one time
+// tagData stores the decoded value of a TIFF field.
 type tagData struct {
-	fType      fieldType
-	length     uint32
-	byteData   []uint8
-	asciiData  string
-	shortData  []uint16
-	longData   []uint32
-	floatData  []float32
-	doubleData []float64
+	fType              fieldType
+	length             uint32
+	byteData           []uint8
+	asciiData          string
+	shortData          []uint16
+	longData           []uint32
+	floatData          []float32
+	doubleData         []float64
+	signedByteData     []int8
+	signedShortData    []int16
+	signedLongData     []int32
+	rationalData       []float64
+	signedRationalData []float64
 }
 
-// Tags holds the tag files
-type Tags map[Tag]tagData
-
-// String converts types to strings
-func (t tagData) String() string {
-	var dataStr string
-	switch t.fType {
-	case SHORT:
-		dataStr = fmt.Sprintf("%v", t.shortData)
-	case LONG:
-		dataStr = fmt.Sprintf("%v", t.longData)
-	case FLOAT:
-		dataStr = fmt.Sprintf("%v", t.floatData)
-	case DOUBLE:
-		dataStr = fmt.Sprintf("%v", t.doubleData)
-	case BYTE:
-		dataStr = fmt.Sprintf("%v", t.byteData)
-	case ASCII:
-		dataStr = fmt.Sprintf("%v", t.asciiData)
+func decodeTagData(ft fieldType, count uint32, raw []byte, order binary.ByteOrder) (*tagData, error) {
+	if uint64(len(raw)) != uint64(count)*ft.bytes() {
+		return nil, fmt.Errorf("invalid byte length for TIFF field type %s", ft)
 	}
-	return t.fType.String() + " " + fmt.Sprintf("%d", t.length) + " " + dataStr
+	t := &tagData{fType: ft, length: count}
+	br := bytes.NewReader(raw)
+	switch ft {
+	case BYTE, UNDEFINED:
+		t.byteData = append([]uint8(nil), raw...)
+	case ASCII:
+		t.asciiData = string(raw)
+	case SHORT:
+		t.shortData = make([]uint16, count)
+		if err := binary.Read(br, order, &t.shortData); err != nil {
+			return nil, err
+		}
+	case LONG, IFDType:
+		t.longData = make([]uint32, count)
+		if err := binary.Read(br, order, &t.longData); err != nil {
+			return nil, err
+		}
+	case FLOAT:
+		t.floatData = make([]float32, count)
+		if err := binary.Read(br, order, &t.floatData); err != nil {
+			return nil, err
+		}
+	case DOUBLE:
+		t.doubleData = make([]float64, count)
+		if err := binary.Read(br, order, &t.doubleData); err != nil {
+			return nil, err
+		}
+	case SBYTE:
+		t.signedByteData = make([]int8, count)
+		for i, b := range raw {
+			t.signedByteData[i] = int8(b)
+		}
+	case SSHORT:
+		t.signedShortData = make([]int16, count)
+		if err := binary.Read(br, order, &t.signedShortData); err != nil {
+			return nil, err
+		}
+	case SLONG:
+		t.signedLongData = make([]int32, count)
+		if err := binary.Read(br, order, &t.signedLongData); err != nil {
+			return nil, err
+		}
+	case RATIONAL:
+		t.rationalData = make([]float64, count)
+		for i := range t.rationalData {
+			var numerator, denominator uint32
+			if err := binary.Read(br, order, &numerator); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(br, order, &denominator); err != nil {
+				return nil, err
+			}
+			if denominator == 0 {
+				return nil, fmt.Errorf("zero denominator in RATIONAL TIFF value")
+			}
+			t.rationalData[i] = float64(numerator) / float64(denominator)
+		}
+	case SRATIONAL:
+		t.signedRationalData = make([]float64, count)
+		for i := range t.signedRationalData {
+			var numerator, denominator int32
+			if err := binary.Read(br, order, &numerator); err != nil {
+				return nil, err
+			}
+			if err := binary.Read(br, order, &denominator); err != nil {
+				return nil, err
+			}
+			if denominator == 0 {
+				return nil, fmt.Errorf("zero denominator in SRATIONAL TIFF value")
+			}
+			t.signedRationalData[i] = float64(numerator) / float64(denominator)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported TIFF field type %d", ft)
+	}
+	return t, nil
 }
 
+// value retains the original package's compact tag-value accessor.
 func (t tagData) value() (fieldType, []interface{}) {
 	switch t.fType {
 	case SHORT:
 		return t.fType, []interface{}{t.shortData}
-	case LONG:
+	case LONG, IFDType:
 		return t.fType, []interface{}{t.longData}
 	case FLOAT:
 		return t.fType, []interface{}{t.floatData}
 	case DOUBLE:
 		return t.fType, []interface{}{t.doubleData}
-	case BYTE:
+	case BYTE, UNDEFINED:
 		return t.fType, []interface{}{t.byteData}
 	case ASCII:
 		return t.fType, []interface{}{t.asciiData}
+	case SBYTE:
+		return t.fType, []interface{}{t.signedByteData}
+	case SSHORT:
+		return t.fType, []interface{}{t.signedShortData}
+	case SLONG:
+		return t.fType, []interface{}{t.signedLongData}
+	case RATIONAL:
+		return t.fType, []interface{}{t.rationalData}
+	case SRATIONAL:
+		return t.fType, []interface{}{t.signedRationalData}
+	default:
+		return NONE, nil
 	}
-	return NONE, nil
 }
 
+func (t tagData) String() string {
+	_, values := t.value()
+	if len(values) == 0 {
+		return fmt.Sprintf("%s %d", t.fType, t.length)
+	}
+	return fmt.Sprintf("%s %d %v", t.fType, t.length, values[0])
+}
+
+// Tags maps TIFF tag identifiers to their values.
+type Tags map[Tag]tagData
+
+// IFD contains a parsed image file directory.
 type IFD struct {
 	Offset     uint32
 	NextOffset int64
 	Tags       Tags
 }
 
-// readTags reads the tags of a GeoTIFF file
-func readTags(r io.ReadSeeker) ([]IFD, head, error) {
-	ifds := make([]IFD, 0)
+var errByteOrder = errors.New("could not parse TIFF header byte order")
+var errGeoTIFFData = errors.New("could not read GeoTIFF data")
 
-	// read the header tag to extract the IFD Byte offset
+func readHeader(r io.Reader) (head, error) {
+	var h head
+	var marker uint16
+	if err := binary.Read(r, binary.BigEndian, &marker); err != nil {
+		return h, fmt.Errorf("%w: %v", errByteOrder, err)
+	}
+	switch marker {
+	case littleEndian:
+		h.byteOrder = binary.LittleEndian
+	case bigEndian:
+		h.byteOrder = binary.BigEndian
+	default:
+		return h, errByteOrder
+	}
+	if err := binary.Read(r, h.byteOrder, &h.tIFIdentifier); err != nil {
+		return h, fmt.Errorf("read TIFF identifier: %w", err)
+	}
+	if h.tIFIdentifier != tiffIdentifier {
+		if h.tIFIdentifier == 43 {
+			return h, errors.New("BigTIFF is not supported")
+		}
+		return h, fmt.Errorf("invalid TIFF identifier: expected %d, got %d", tiffIdentifier, h.tIFIdentifier)
+	}
+	if err := binary.Read(r, h.byteOrder, &h.iFDByteOffset); err != nil {
+		return h, fmt.Errorf("read first IFD offset: %w", err)
+	}
+	return h, nil
+}
+
+// readTags reads every classic TIFF IFD. It appends each directory once,
+// after all of its entries and its actual next-IFD pointer have been read.
+func readTags(r io.ReadSeeker) ([]IFD, head, error) {
+	ifds := make([]IFD, 0, 1)
 	h, err := readHeader(r)
 	if err != nil {
-		return ifds, h, fmt.Errorf("failed to read tiff header: %w", err)
+		return ifds, h, fmt.Errorf("failed to read TIFF header: %w", err)
+	}
+	fileSize, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return ifds, h, fmt.Errorf("determine TIFF file size: %w", err)
+	}
+	if fileSize < 8 {
+		return ifds, h, errors.New("truncated TIFF header")
 	}
 
-	// Get the first IFD entry via the IFD Byte offset recorded in the header
-	// via SeekStart
-	//
-	// From the TIFF 6.0 Specification (p.13)
-	//
-	// The offset (in bytes) of the first IFD. The directory may be at any location in the
-	// file after the header but must begin on a word boundary. In particular, an
-	// Image File Directory may follow the image data it describes. Readers
-	// must follow the pointers wherever they may lead. The term byte offset is
-	// always used in this document to refer to a location with respect to the
-	// beginning of the TIFF file. The first byte of the file has an offset of
-	// 0.
-	iFDOffset := h.iFDByteOffset
-
-	for iFDOffset != 0 {
-		currentIFD := IFD{
-			Offset: iFDOffset,
-			Tags:   make(Tags),
+	offset := h.iFDByteOffset
+	visited := make(map[uint32]struct{})
+	for offset != 0 {
+		if _, exists := visited[offset]; exists {
+			return ifds, h, fmt.Errorf("cyclic IFD pointer at offset %d", offset)
+		}
+		visited[offset] = struct{}{}
+		if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
+			return ifds, h, fmt.Errorf("seek to IFD at %d: %w", offset, err)
+		}
+		var count uint16
+		if err := binary.Read(r, h.byteOrder, &count); err != nil {
+			return ifds, h, fmt.Errorf("read IFD entry count at %d: %w", offset, err)
+		}
+		if count == 0 {
+			return ifds, h, fmt.Errorf("IFD at offset %d contains no entries", offset)
 		}
 
-		// Jump to the IFD Byte Offset
-		if _, err := r.Seek(int64(iFDOffset), io.SeekStart); err != nil {
-			return ifds, h, fmt.Errorf("error: unable to seek to start of IFD at %d", iFDOffset)
-		}
-
-		// Per the TIFF 6.0 Specification (p.14)
-		//
-		// The number of Directory Entries is contained in the
-		// first two bytes of each IFD
-		var numDirectoryEntries uint16
-		if err := binary.Read(r, h.byteOrder, &numDirectoryEntries); err != nil {
-			return ifds, h, errors.New("error: unable to read directory entry")
-		}
-		var nextDirOffset int64
-		for i := uint16(0); i < numDirectoryEntries; i++ {
-
-			var iFDEntry iFDEntry
-			if err := binary.Read(r, h.byteOrder, &iFDEntry); err != nil {
-				return ifds, h, err
+		current := IFD{Offset: offset, Tags: make(Tags)}
+		for i := uint16(0); i < count; i++ {
+			entryStart, seekErr := r.Seek(0, io.SeekCurrent)
+			if seekErr != nil {
+				return ifds, h, seekErr
 			}
-
-			if iFDEntry.FType.bytes() == 0 {
-				return ifds, h, fmt.Errorf("error: unrecognized tag %d", iFDEntry.Tag)
+			var entry iFDEntry
+			if err := binary.Read(r, h.byteOrder, &entry); err != nil {
+				return ifds, h, fmt.Errorf("read IFD entry %d at %d: %w", i, offset, err)
 			}
-
-			// Per the TIFF 6.0 Specification
-			//
-			// If the Value is shorter than 4 bytes, it is left-justified
-			// within the 4-byte Value Offset, i.e., stored in the
-			// lower numbered bytes.
-			//
-			// Whether the Value fits within 4 bytes is determined by the Type
-			// and Count of the field
-			if iFDEntry.totalBytes() <= fourByte {
-				currentOffset, _ := r.Seek(0, io.SeekCurrent)
-				iFDEntry.ValueOffset = uint32(currentOffset) - fourByte
+			entryEnd := entryStart + 12
+			if entry.FType.bytes() == 0 {
+				// Unknown field types cannot be safely decoded, but the 12-byte
+				// entry itself is known, so skip it and continue with other tags.
+				continue
 			}
-
-			nextDirOffset, _ = r.Seek(0, io.SeekCurrent)
-
-			// Read the tags
-			tagName := iFDEntry.Tag
-			tagvalue, err := iFDEntry.value(r, h.byteOrder)
+			valueOffset := int64(entry.ValueOffset)
+			if entry.totalBytes() <= fourByte {
+				// The value is stored in the entry's final four bytes. Preserve
+				// its byte sequence exactly; interpreting ValueOffset as an
+				// integer would reverse inline ASCII/BYTE values on one endian.
+				valueOffset = entryStart + 8
+				if valueOffset > math.MaxUint32 {
+					return ifds, h, fmt.Errorf("inline value for tag %s has an invalid offset", entry.Tag)
+				}
+				entry.ValueOffset = uint32(valueOffset)
+			}
+			valueSize := entry.totalBytes()
+			if valueOffset < 0 || valueOffset > fileSize || valueSize > uint64(fileSize-valueOffset) {
+				return ifds, h, fmt.Errorf("value for tag %s lies outside the TIFF file", entry.Tag)
+			}
+			value, err := entry.value(r, h.byteOrder)
 			if err != nil {
 				return ifds, h, err
 			}
-			currentIFD.Tags[tagName] = *tagvalue
-
-			// Jump to the next directory entry
-			if _, err := r.Seek(nextDirOffset, io.SeekStart); err != nil {
-				return ifds, h, fmt.Errorf("err: could not jump to next directory: %w", err)
+			current.Tags[entry.Tag] = *value
+			if _, err := r.Seek(entryEnd, io.SeekStart); err != nil {
+				return ifds, h, fmt.Errorf("restore IFD position: %w", err)
 			}
-
-			currentIFD.NextOffset = nextDirOffset
-
-			ifds = append(ifds, currentIFD)
 		}
-
-		if err = binary.Read(r, h.byteOrder, &iFDOffset); err != nil {
-			return ifds, h, fmt.Errorf("err: could not jump to next file: %w", err)
+		var next uint32
+		if err := binary.Read(r, h.byteOrder, &next); err != nil {
+			return ifds, h, fmt.Errorf("read next IFD offset after %d: %w", offset, err)
 		}
+		current.NextOffset = int64(next)
+		ifds = append(ifds, current)
+		offset = next
 	}
 	return ifds, h, nil
 }
 
-var errGeoTIFFData = errors.New("could not read GeoTIFF data")
-
-// tagUint32Slice returns the values of a tag as a []uint32 slice, accepting
-// both SHORT (uint16) and LONG (uint32) field types.  This is necessary
-// because the TIFF spec allows writers to use either type for fields such as
-// ImageWidth, ImageLength, RowsPerStrip, TileWidth, TileLength,
-// StripOffsets, StripByteCounts, TileOffsets and TileByteCounts.
+// tagUint32Slice returns a tag as unsigned integers, accepting TIFF SHORT
+// and LONG (and the classic IFD type).
 func tagUint32Slice(tags Tags, tag Tag) ([]uint32, error) {
 	v, ok := tags[tag]
 	if !ok {
-		return nil, fmt.Errorf("%w, could not retrieve %s", errGeoTIFFData, tag)
+		return nil, fmt.Errorf("%w: missing tag %s", errGeoTIFFData, tag)
 	}
-	ftype, elem := v.value()
-	switch ftype {
+	switch v.fType {
 	case SHORT:
-		shorts := elem[0].([]uint16)
-		longs := make([]uint32, len(shorts))
-		for i, s := range shorts {
-			longs[i] = uint32(s)
+		out := make([]uint32, len(v.shortData))
+		for i, x := range v.shortData {
+			out[i] = uint32(x)
 		}
-		return longs, nil
-	case LONG:
-		return elem[0].([]uint32), nil
+		return out, nil
+	case LONG, IFDType:
+		return append([]uint32(nil), v.longData...), nil
 	default:
-		return nil, fmt.Errorf("%w, incorrect data type for %s - %s", errGeoTIFFData, tag, ftype)
+		return nil, fmt.Errorf("%w: tag %s has type %s, expected SHORT or LONG", errGeoTIFFData, tag, v.fType)
 	}
 }
 
+func optionalTagUint32(tags Tags, tag Tag, defaultValue uint32) ([]uint32, error) {
+	if _, ok := tags[tag]; !ok {
+		return []uint32{defaultValue}, nil
+	}
+	return tagUint32Slice(tags, tag)
+}
+
+func oneTagUint32(tags Tags, tag Tag, defaultValue uint32) (uint32, error) {
+	values, err := optionalTagUint32(tags, tag, defaultValue)
+	if err != nil {
+		return 0, err
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("tag %s must contain exactly one value, got %d", tag, len(values))
+	}
+	return values[0], nil
+}
+
+func tagDoubleSlice(tags Tags, tag Tag) ([]float64, error) {
+	v, ok := tags[tag]
+	if !ok {
+		return nil, fmt.Errorf("%w: missing tag %s", errGeoTIFFData, tag)
+	}
+	if v.fType != DOUBLE {
+		return nil, fmt.Errorf("%w: tag %s has type %s, expected DOUBLE", errGeoTIFFData, tag, v.fType)
+	}
+	return append([]float64(nil), v.doubleData...), nil
+}
+
+// validateRasterLayout deliberately limits decoding to a known-safe TIFF
+// layout. TIFF defaults are applied where the specification defines them.
+func validateRasterLayout(tags Tags) error {
+	bits, err := tagUint32Slice(tags, BitsPerSample)
+	if err != nil {
+		return err
+	}
+	if len(bits) != 1 || bits[0] != 32 {
+		return fmt.Errorf("unsupported BitsPerSample %v: only one 32-bit sample is supported", bits)
+	}
+	samples, err := oneTagUint32(tags, SamplesPerPixel, 1)
+	if err != nil {
+		return err
+	}
+	if samples != 1 {
+		return fmt.Errorf("unsupported SamplesPerPixel %d: only single-band rasters are supported", samples)
+	}
+	sampleFormat, err := oneTagUint32(tags, SampleFormat, 1)
+	if err != nil {
+		return err
+	}
+	if sampleFormat != 3 {
+		return fmt.Errorf("unsupported SampleFormat %d: expected IEEE floating point (3)", sampleFormat)
+	}
+	compression, err := compressionFromTags(tags)
+	if err != nil {
+		return err
+	}
+	if _, ok := compressionNames[compression]; !ok {
+		return fmt.Errorf("%w: unsupported compression %d", errGeoTIFFData, sampleFormat)
+	}
+	planar, err := oneTagUint32(tags, PlanarConfiguration, 1)
+	if err != nil {
+		return err
+	}
+	if planar != 1 {
+		return fmt.Errorf("unsupported PlanarConfiguration %d: only chunky/contiguous layout is supported", planar)
+	}
+	predictor, err := oneTagUint32(tags, Predictor, 1)
+	if err != nil {
+		return err
+	}
+	if predictor != 1 {
+		return fmt.Errorf("unsupported Predictor %d: only predictor 1 is supported", predictor)
+	}
+	fillOrder, err := oneTagUint32(tags, FillOrder, 1)
+	if err != nil {
+		return err
+	}
+	if fillOrder != 1 {
+		return fmt.Errorf("unsupported FillOrder %d: only fill order 1 is supported", fillOrder)
+	}
+	orientation, err := oneTagUint32(tags, Orientation, 1)
+	if err != nil {
+		return err
+	}
+	if orientation != 1 {
+		return fmt.Errorf("unsupported Orientation %d: only top-left orientation (1) is supported", orientation)
+	}
+	return nil
+}
+
+func readFloat32Block(r io.ReadSeeker, offset, byteCount uint32, expectedValues uint64, order binary.ByteOrder, label string) ([]float32, error) {
+	expectedBytes := expectedValues * 4
+	if expectedBytes > math.MaxUint32 || uint64(byteCount) != expectedBytes {
+		return nil, fmt.Errorf("%s has %d bytes; expected %d for %d Float32 samples", label, byteCount, expectedBytes, expectedValues)
+	}
+	if expectedValues > uint64(int(^uint(0)>>1)) {
+		return nil, fmt.Errorf("%s is too large for this platform", label)
+	}
+	if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("%w: seek to %s at %d: %v", errGeoTIFFData, label, offset, err)
+	}
+	values := make([]float32, int(expectedValues))
+	if err := binary.Read(r, order, values); err != nil {
+		return nil, fmt.Errorf("%w: read %s: %v", errGeoTIFFData, label, err)
+	}
+	return values, nil
+}
+
+// readData reads tiled, uncompressed, single-band Float32 data.
 // readData reads the data from a tiled GeoTIFF file
 // into a 2D 32-bit float array (one slice per tile).
 func readData(r io.ReadSeeker, tags Tags, header head) ([][]float32, error) {
@@ -376,13 +491,30 @@ func readData(r io.ReadSeeker, tags Tags, header head) ([][]float32, error) {
 		return nil, err
 	}
 
+	compression, err := compressionFromTags(tags)
+	if err != nil {
+		return nil, err
+	}
+
 	imageWidth := imageWidthVals[0]
 	imageLength := imageLengthVals[0]
 	tileWidth := tileWidthVals[0]
 	tileLength := tileLengthVals[0]
 	bitsPerSample := bitsPerSampleVals[0]
 
-	// From the Tiff 6.0 Specification (p. 67)
+	// This reader currently interprets samples as Float32.
+	if bitsPerSample != 32 {
+		return nil, fmt.Errorf(
+			"unsupported BitsPerSample value: %d (only 32-bit samples are supported)",
+			bitsPerSample,
+		)
+	}
+
+	if tileWidth == 0 || tileLength == 0 {
+		return nil, errors.New("invalid tile dimensions")
+	}
+
+	// From the TIFF 6.0 Specification (p. 67).
 	tilesAcross := (imageWidth + tileWidth - 1) / tileWidth
 	tilesDown := (imageLength + tileLength - 1) / tileLength
 	tilesPerImage := tilesAcross * tilesDown
@@ -390,21 +522,47 @@ func readData(r io.ReadSeeker, tags Tags, header head) ([][]float32, error) {
 	if int(tilesPerImage) != len(offsets) {
 		return nil, errors.New("invalid number of offsets for tiles")
 	}
+	if len(byteCounts) != len(offsets) {
+		return nil, errors.New("number of tile byte counts does not match tile offsets")
+	}
 
+	// TIFF tiles are stored at their full tile dimensions, including
+	// padding on the right and bottom edges of the image.
+	expectedBytes, err := expectedFloat32Bytes(tileWidth, tileLength)
+	if err != nil {
+		return nil, err
+	}
+
+	numPixels := int(expectedBytes / 4)
 	data := make([][]float32, 0, tilesPerImage)
+
 	for i, offset := range offsets {
-		numPixels := byteCounts[i] / (bitsPerSample / eightByte)
-		tileData := make([]float32, numPixels)
-		if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
-			return nil, fmt.Errorf("%w: could not find offset: got %s", errGeoTIFFData, err)
+		raw, err := readTIFFBlock(
+			r,
+			offset,
+			byteCounts[i],
+			compression,
+			expectedBytes,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read tile %d: %w", i, err)
 		}
 
-		if err := binary.Read(r, header.byteOrder, &tileData); err != nil {
-			return nil, fmt.Errorf("%w: could not read bytes: got %s", errGeoTIFFData, err)
+		tileData := make([]float32, numPixels)
+		if err := binary.Read(
+			bytes.NewReader(raw),
+			header.byteOrder,
+			&tileData,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"%w: could not decode tile %d samples: %v",
+				errGeoTIFFData, i, err,
+			)
 		}
 
 		data = append(data, tileData)
 	}
+
 	return data, nil
 }
 
@@ -413,21 +571,18 @@ func readData(r io.ReadSeeker, tags Tags, header head) ([][]float32, error) {
 //
 // The returned layout is compatible with loc(): each strip is treated as a
 // "tile" whose effective width equals imageWidth and effective height equals
-// rowsPerStrip, so the existing tile-index arithmetic in loc() works without
-// modification.
+// rowsPerStrip.
 func readStripData(r io.ReadSeeker, tags Tags, header head) ([][]float32, error) {
 	bitsPerSampleVals, err := tagUint32Slice(tags, BitsPerSample)
 	if err != nil {
 		return nil, err
 	}
-	imageLengthVals, err := tagUint32Slice(tags, ImageLength)
+	imageWidthVals, err := tagUint32Slice(tags, ImageWidth)
 	if err != nil {
 		return nil, err
 	}
-	// Validate that ImageWidth is present; it is required by the TIFF spec even
-	// though readStripData does not use it (per-strip byte counts already encode
-	// the row width).
-	if _, err := tagUint32Slice(tags, ImageWidth); err != nil {
+	imageLengthVals, err := tagUint32Slice(tags, ImageLength)
+	if err != nil {
 		return nil, err
 	}
 	rowsPerStripVals, err := tagUint32Slice(tags, RowsPerStrip)
@@ -443,465 +598,619 @@ func readStripData(r io.ReadSeeker, tags Tags, header head) ([][]float32, error)
 		return nil, err
 	}
 
-	imageLength := imageLengthVals[0]
-	rowsPerStrip := rowsPerStripVals[0]
-	bitsPerSample := bitsPerSampleVals[0]
-
-	// From the TIFF 6.0 Specification (p.38):
-	// StripsPerImage = floor((ImageLength + RowsPerStrip - 1) / RowsPerStrip)
-	numStrips := (imageLength + rowsPerStrip - 1) / rowsPerStrip
-
-	if int(numStrips) != len(offsets) {
-		return nil, errors.New("invalid number of offsets for strips")
-	}
-
-	data := make([][]float32, 0, numStrips)
-	for i, offset := range offsets {
-		numPixels := byteCounts[i] / (bitsPerSample / eightByte)
-		stripData := make([]float32, numPixels)
-		if _, err := r.Seek(int64(offset), io.SeekStart); err != nil {
-			return nil, fmt.Errorf("%w: could not find offset: got %s", errGeoTIFFData, err)
-		}
-		if err := binary.Read(r, header.byteOrder, &stripData); err != nil {
-			return nil, fmt.Errorf("%w: could not read bytes: got %s", errGeoTIFFData, err)
-		}
-		data = append(data, stripData)
-	}
-	return data, nil
-}
-
-// GeoTIFF a geotiff object
-type GeoTIFF struct {
-	tags        Tags
-	data        [][]float32
-	imageWidth  uint16
-	imageLength uint16
-	tileWidth   uint16
-	tileLength  uint16
-	PixelScaleX float64
-	PixelScaleY float64
-}
-
-// AtCoord returns the value closest to the requested latitude and longitude value
-//
-// If the value does not exist (i.e., the location requested) falls in between
-// multiple grid points.
-//
-// Interp indicates if bilinear interpolation should be done along
-// either direction
-func (g *GeoTIFF) AtCoord(x float64, y float64, interp bool) (float32, error) {
-	rect, err := g.Bounds()
-	if err != nil {
-		return 0, err
-	}
-	p := Point{Lon: x, Lat: y}
-	if !rect.Contains(p) {
-		return 0, fmt.Errorf("requested point %s does not fall inside the image bounds", p)
-	}
-
-	if interp {
-		return g.interp(p)
-	}
-
-	xIDx := int(math.Abs(rect.UpperLeft.Lon-p.Lon) / g.PixelScaleX)
-	yIDx := int(math.Abs(p.Lat-rect.UpperLeft.Lat) / g.PixelScaleY)
-	val, err := g.loc(xIDx, yIDx)
-	if err != nil {
-		return 0, err
-	}
-	return val, nil
-}
-
-// interp computes bilinear interpolation between
-// four point values
-//
-// This isn't perfect as it doesn't completely solve for the face that data is only
-// available at grid points
-func (g *GeoTIFF) interp(p Point) (float32, error) {
-	points := []Point{
-		{
-			Lon: p.Lon - g.PixelScaleX,
-			Lat: p.Lat,
-		},
-		{
-			Lon: p.Lon + g.PixelScaleX,
-			Lat: p.Lat,
-		},
-		{
-			Lon: p.Lon,
-			Lat: p.Lat - g.PixelScaleY,
-		},
-		{
-			Lon: p.Lon,
-			Lat: p.Lat + g.PixelScaleY,
-		},
-	}
-
-	pointValues, err := g.AtPoints(points, false)
-	if err != nil {
-		return 0, err
-	}
-	// See: https://en.wikipedia.org/wiki/Bilinear_interpolation
-	// All the coefficients are equivalent here as it is assumed the grid is equal (which is not correct)
-	// therefore the result is just the mean value
-	var pv float32 = 0.0
-	for _, pvals := range pointValues {
-		pv += pvals
-	}
-	return pv / 4.0, nil
-}
-
-// AtPoints returns image values at
-// a specified slice of points
-func (g *GeoTIFF) AtPoints(points []Point, interp bool) ([]float32, error) {
-	data := make([]float32, 0, len(points))
-	for i, p := range points {
-		v, err := g.AtCoord(p.Lon, p.Lat, interp)
-		if err != nil {
-			return nil, err
-		}
-		data[i] = v
-	}
-	return data, nil
-}
-
-// loc returns data by location (i.e. an X, and Y point on the image)
-func (g *GeoTIFF) loc(x int, y int) (float32, error) {
-	if x < 0 || x >= int(g.imageWidth) || y < 0 || y >= int(g.imageLength) {
-		return 0.0, errors.New("point lies outside image")
-	}
-
-	// The data is read into the array from the top left corner in tiles
-	// it starts at (0, 0) and reads in to (0, tileWidth) before repeating this to
-	// (tileWidth, tileLength) before beginning to read in at (tileWidth, 0) and
-	// repeating this process. The buffer is placed on the bottom and the right hand side
-	//
-	//  This means the data is read in in the order shown below
-	//   ------------------------------    ...
-	//   |         |         |      | 0 0 ..  |   ...
-	//   |    0    |    1    |   2  | 0 0 ..  |   ...
-	//   |         |         |      | 0 0 ..  |   ...
-	//   |---------|---------|------|---------|   ...
-	//   |         |         |      | 0 0 ..  |   ...
-	//   |    3    |    4    |   5  | 0 0 ..  |   ...
-	//   |         |         |      | 0 0 ..  |   ...
-	//   |---------|---------|------|---------|   ...
-	//   |         |         |      | 0 0 ..  |   ...
-	//   |    6    |    7    |   8  | 0 0 ..  |   ...
-	//   |    .    |    .    |   .  | 0 0 ..  |   ...
-	//   |    .    |    .    |   .  | 0 0 ..  |   ...
-	//
-	tilesAcross := int(g.imageWidth+g.tileWidth-1) / int(g.tileWidth)
-	idAcross := x / int(g.tileWidth)
-	idDown := y / int(g.tileLength)
-	tileNum := tilesAcross*idDown + idAcross
-	idI := x % int(g.tileWidth)
-	idJ := (y % int(g.tileLength)) * int(g.tileWidth)
-	return g.data[tileNum][idJ+idI], nil
-}
-
-// Bounds returns the bounding rectangle of the image
-func (g *GeoTIFF) Bounds() (*CornerCoordinates, error) {
-	// Check for the model tie point
-	tiePoint, ok := g.tags[ModelTiepoint]
-
-	// TODO: add transformation
-	if !ok {
-		return nil, errors.New("unable to retrieve model tiepoint:  ModelTransformationTag not implemented")
-	}
-
-	// https://freeimage.sourceforge.io/fnet/html/38F9430A.htm
-	//
-	// ModelTiePoints = (...,I,J,K, X,Y,Z...), where (I,J,K) is the point at
-	// location (I,J) in raster space with pixel-value K, and (X,Y,Z) is a
-	// vector in model space. In most cases the model space is only
-	// two-dimensional, in which case both K and Z should be set to zero; this
-	// third dimension is provided in anticipation of future support for 3D
-	// digital elevation models and vertical coordinate systems. A raster image
-	// may be georeferenced simply by specifying its location, size and
-	// orientation in the model coordinate space M. This may be done by
-	// specifying the location of three of the four bounding corner points.
-	// However, tiepoints are only to be considered exact at the points
-	// specified; thus defining such a set of bounding tiepoints does not imply
-	// that the model space locations of the interior of the image may be
-	// exactly computed by a linear interpolation of these tiepoints.
-	tiePointLen := 6
-	if int(tiePoint.length) != tiePointLen {
-		return nil, fmt.Errorf("%s has invalid length %d", ModelTiepoint, tiePoint.length)
-	}
-	var tiePointValues []float64
-	ftype, e := tiePoint.value()
-	switch ftype {
-	case DOUBLE:
-		tiePointValues = e[0].([]float64)
-	default:
-		return nil, errors.New("unrecognized value for tiepoint")
-	}
-
-	i := tiePointValues[0]
-	j := tiePointValues[1]
-	x := tiePointValues[3]
-	y := tiePointValues[4]
-
-	cc := CornerCoordinates{}
-
-	cc.UpperLeft = Point{
-		Lon: x - i*g.PixelScaleX,
-		Lat: y + j*g.PixelScaleY,
-	}
-
-	cc.LowerRight = Point{
-		Lon: x + (float64(g.imageWidth)-i)*g.PixelScaleX,
-		Lat: y - (float64(g.imageLength)-j)*g.PixelScaleY,
-	}
-
-	cc.LowerLeft = Point{
-		Lon: cc.UpperLeft.Lon,
-		Lat: cc.LowerRight.Lat,
-	}
-
-	cc.UpperRight = Point{
-		Lon: cc.LowerRight.Lon,
-		Lat: cc.UpperLeft.Lat,
-	}
-	return &cc, nil
-}
-
-// Point contains X, Y longitude and latitude points
-type Point struct {
-	Lon float64
-	Lat float64
-}
-
-// String matches the formatting from gdalinfo
-func (p Point) String() string {
-	return fmt.Sprintf("%011.7f,  %011.7f", p.Lon, p.Lat)
-}
-
-// Equals checks if two points are equal
-func (p *Point) Equals(px Point) bool {
-	return p.Lon == px.Lon && p.Lat == px.Lat
-}
-
-// Distance returns the haversine distance between any two points
-// in metres
-func (p *Point) Distance(px Point) float64 {
-	// https://en.wikipedia.org/wiki/Earth_radius#Mean_radius
-	const earthRadiusInMetres = 6371008.8
-	d2R := func(deg float64) float64 {
-		return math.Pi * deg / 180.0
-	}
-	latSin := math.Pow(math.Sin(d2R(px.Lat-p.Lat)/2.0), 2)
-	lonSin := math.Pow(math.Sin(d2R(px.Lon-p.Lon)/2.0), 2)
-	cosLat := math.Cos(d2R(px.Lat)) * math.Cos(d2R(p.Lat))
-	return float64(earthRadiusInMetres*2) * math.Asin(math.Sqrt(latSin+lonSin*cosLat))
-}
-
-// CornerCoordinates contains the GeoTiffs corners
-type CornerCoordinates struct {
-	UpperLeft  Point
-	LowerLeft  Point
-	UpperRight Point
-	LowerRight Point
-}
-
-// Contains checks if a point falls inside the corner coordinates
-func (cc CornerCoordinates) Contains(p Point) bool {
-	return cc.UpperLeft.Lon <= p.Lon && p.Lon <= cc.UpperRight.Lon &&
-		cc.LowerLeft.Lat <= p.Lat && p.Lat <= cc.UpperLeft.Lat
-}
-
-func (cc CornerCoordinates) String() string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Upper Left   ( %s )\n", cc.UpperLeft))
-	sb.WriteString(fmt.Sprintf("Lower Left   ( %s )\n", cc.LowerLeft))
-	sb.WriteString(fmt.Sprintf("Upper Right  ( %s )\n", cc.UpperRight))
-	sb.WriteString(fmt.Sprintf("Lower Right  ( %s )\n", cc.LowerRight))
-	return sb.String()
-}
-
-// Read reads the GeoTIFF file.
-//
-// Read automatically detects whether the file uses the tiled or striped
-// organisation and dispatches to the appropriate internal reader. For striped
-// files the effective tile dimensions are set to (imageWidth, rowsPerStrip) so
-// that the existing loc() arithmetic works without modification.
-func Read(r io.ReadSeeker) (*GeoTIFF, error) {
-	gIfds, header, err := readTags(r)
+	compression, err := compressionFromTags(tags)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO : use multiple ifds if available. For now, we just take the first one
-	gTags := gIfds[0].Tags
+	imageWidth := imageWidthVals[0]
+	imageLength := imageLengthVals[0]
+	rowsPerStrip := rowsPerStripVals[0]
+	bitsPerSample := bitsPerSampleVals[0]
 
-	var (
-		gData                                   [][]float32
-		imageWidth, imageLength, tileW, tileLen uint16
-	)
+	if bitsPerSample != 32 {
+		return nil, fmt.Errorf(
+			"unsupported BitsPerSample value: %d (only 32-bit samples are supported)",
+			bitsPerSample,
+		)
+	}
 
-	_, hasTileWidth := gTags[TileWidth]
-	_, hasTileLength := gTags[TileLength]
+	if imageWidth == 0 || imageLength == 0 || rowsPerStrip == 0 {
+		return nil, errors.New("invalid image or strip dimensions")
+	}
 
-	if hasTileWidth && hasTileLength {
-		// Tiled format
-		gData, err = readData(r, gTags, header)
-		if err != nil {
-			return nil, err
+	// From the TIFF 6.0 Specification (p. 38).
+	numStrips := (uint64(imageLength) + uint64(rowsPerStrip) - 1) /
+		uint64(rowsPerStrip)
+
+	if numStrips != uint64(len(offsets)) {
+		return nil, errors.New("invalid number of offsets for strips")
+	}
+	if len(byteCounts) != len(offsets) {
+		return nil, errors.New("number of strip byte counts does not match strip offsets")
+	}
+
+	data := make([][]float32, 0, len(offsets))
+
+	for i, offset := range offsets {
+		// Determine how many rows are actually present in this strip.
+		rowStart := uint64(i) * uint64(rowsPerStrip)
+		remainingRows := uint64(imageLength) - rowStart
+
+		rowsInStrip := uint64(rowsPerStrip)
+		if rowsInStrip > remainingRows {
+			rowsInStrip = remainingRows
 		}
 
-		for _, f := range [...]Tag{ImageLength, ImageWidth, TileWidth, TileLength} {
-			vals, ferr := tagUint32Slice(gTags, f)
-			if ferr != nil {
-				return nil, ferr
+		expectedBytes, err := expectedFloat32Bytes(
+			imageWidth,
+			uint32(rowsInStrip),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("invalid strip %d dimensions: %w", i, err)
+		}
+
+		raw, err := readTIFFBlock(
+			r,
+			offset,
+			byteCounts[i],
+			compression,
+			expectedBytes,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read strip %d: %w", i, err)
+		}
+
+		stripData := make([]float32, int(expectedBytes/4))
+		if err := binary.Read(
+			bytes.NewReader(raw),
+			header.byteOrder,
+			&stripData,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"%w: could not decode strip %d samples: %v",
+				errGeoTIFFData, i, err,
+			)
+		}
+
+		data = append(data, stripData)
+	}
+
+	return data, nil
+}
+
+// GeoTIFF stores decoded Float32 samples in TIFF block order. Dimensions use
+// uint32 because classic TIFF dimensions are not restricted to uint16.
+type GeoTIFF struct {
+	tags        Tags
+	data        [][]float32
+	imageWidth  uint32
+	imageLength uint32
+	tileWidth   uint32
+	tileLength  uint32
+	PixelScaleX float64
+	PixelScaleY float64
+
+	// affine maps raster coordinates (i,j) to model coordinates:
+	// X = a*i + b*j + c; Y = d*i + e*j + f.
+	affine       [6]float64
+	hasAffine    bool
+	pixelIsPoint bool
+}
+
+func (g *GeoTIFF) setRasterType() error {
+	g.pixelIsPoint = false // GeoTIFF default is RasterPixelIsArea.
+	v, ok := g.tags[GeoKeyDirectory]
+	if !ok {
+		return nil
+	}
+	if v.fType != SHORT || len(v.shortData) < 4 {
+		return errors.New("invalid GeoKeyDirectoryTag")
+	}
+	keys := v.shortData
+	numKeys := int(keys[3])
+	if len(keys) < 4+numKeys*4 {
+		return errors.New("truncated GeoKeyDirectoryTag")
+	}
+	const rasterTypeKey uint16 = 1025
+	for i := 0; i < numKeys; i++ {
+		base := 4 + i*4
+		keyID, location, count, valueOffset := keys[base], keys[base+1], keys[base+2], keys[base+3]
+		if keyID != rasterTypeKey {
+			continue
+		}
+		if location != 0 || count != 1 {
+			return errors.New("unsupported non-inline GTRasterTypeGeoKey")
+		}
+		switch valueOffset {
+		case 1:
+			g.pixelIsPoint = false
+		case 2:
+			g.pixelIsPoint = true
+		default:
+			return fmt.Errorf("invalid GTRasterTypeGeoKey value %d", valueOffset)
+		}
+	}
+	return nil
+}
+
+func (g *GeoTIFF) ensureAffine() error {
+	if g.hasAffine {
+		return nil
+	}
+	if g.tags == nil {
+		return errors.New("missing georeferencing tags")
+	}
+	if err := g.setRasterType(); err != nil {
+		return err
+	}
+
+	if _, ok := g.tags[ModelTransformation]; ok {
+		m, err := tagDoubleSlice(g.tags, ModelTransformation)
+		if err != nil {
+			return err
+		}
+		if len(m) != 16 {
+			return fmt.Errorf("%s must contain 16 DOUBLE values, got %d", ModelTransformation, len(m))
+		}
+		for _, x := range m {
+			if math.IsNaN(x) || math.IsInf(x, 0) {
+				return errors.New("ModelTransformation contains a non-finite value")
 			}
-			switch f {
-			case ImageWidth:
-				imageWidth = uint16(vals[0])
-			case ImageLength:
-				imageLength = uint16(vals[0])
-			case TileWidth:
-				tileW = uint16(vals[0])
-			case TileLength:
-				tileLen = uint16(vals[0])
+		}
+		// This implementation supports affine 2D transformations. Perspective
+		// terms and the homogeneous denominator are not used.
+		if math.Abs(m[12]) > 1e-12 || math.Abs(m[13]) > 1e-12 || math.Abs(m[15]-1) > 1e-12 {
+			return errors.New("unsupported projective ModelTransformation")
+		}
+		g.affine = [6]float64{m[0], m[1], m[3], m[4], m[5], m[7]}
+		g.PixelScaleX = math.Hypot(m[0], m[4])
+		g.PixelScaleY = math.Hypot(m[1], m[5])
+	} else {
+		scale, err := tagDoubleSlice(g.tags, ModelPixelScale)
+		if err != nil {
+			return fmt.Errorf("missing or invalid %s: %w", ModelPixelScale, err)
+		}
+		if len(scale) != 3 {
+			return fmt.Errorf("%s must contain three DOUBLE values, got %d", ModelPixelScale, len(scale))
+		}
+		if scale[0] <= 0 || scale[1] <= 0 || math.IsNaN(scale[0]) || math.IsNaN(scale[1]) || math.IsInf(scale[0], 0) || math.IsInf(scale[1], 0) {
+			return errors.New("ModelPixelScale X and Y values must be finite and greater than zero")
+		}
+		tie, err := tagDoubleSlice(g.tags, ModelTiepoint)
+		if err != nil {
+			return fmt.Errorf("missing or invalid %s: %w", ModelTiepoint, err)
+		}
+		if len(tie) != 6 {
+			return fmt.Errorf("%s must contain exactly six DOUBLE values, got %d", ModelTiepoint, len(tie))
+		}
+		for _, x := range tie {
+			if math.IsNaN(x) || math.IsInf(x, 0) {
+				return errors.New("ModelTiepoint contains a non-finite value")
 			}
+		}
+		// X = X0 + (i-I0)*ScaleX; Y = Y0 - (j-J0)*ScaleY.
+		g.affine = [6]float64{scale[0], 0, tie[3] - tie[0]*scale[0], 0, -scale[1], tie[4] + tie[1]*scale[1]}
+		g.PixelScaleX, g.PixelScaleY = scale[0], scale[1]
+	}
+	det := g.affine[0]*g.affine[4] - g.affine[1]*g.affine[3]
+	if math.Abs(det) < 1e-18 || math.IsNaN(det) || math.IsInf(det, 0) {
+		return errors.New("georeferencing transform is singular")
+	}
+	g.hasAffine = true
+	return nil
+}
+
+func (g *GeoTIFF) rasterToModel(i, j float64) (x, y float64) {
+	a := g.affine
+	return a[0]*i + a[1]*j + a[2], a[3]*i + a[4]*j + a[5]
+}
+
+func (g *GeoTIFF) modelToRaster(x, y float64) (i, j float64, err error) {
+	if err = g.ensureAffine(); err != nil {
+		return 0, 0, err
+	}
+	a := g.affine
+	det := a[0]*a[4] - a[1]*a[3]
+	dx, dy := x-a[2], y-a[5]
+	i = (dx*a[4] - a[1]*dy) / det
+	j = (a[0]*dy - dx*a[3]) / det
+	return i, j, nil
+}
+
+func (g *GeoTIFF) AtCoord(x, y float64, interp bool) (float32, error) {
+	if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+		return 0, errors.New("requested coordinates must be finite")
+	}
+	if g.imageWidth == 0 || g.imageLength == 0 {
+		return 0, errors.New("image dimensions are zero")
+	}
+	i, j, err := g.modelToRaster(x, y)
+	if err != nil {
+		return 0, err
+	}
+
+	const eps = 1e-9
+	if g.pixelIsPoint {
+		if i < -eps || j < -eps || i > float64(g.imageWidth-1)+eps || j > float64(g.imageLength-1)+eps {
+			return 0, fmt.Errorf("requested point %s lies outside the raster", (Point{Lon: x, Lat: y}))
 		}
 	} else {
-		// Striped format
-		gData, err = readStripData(r, gTags, header)
+		// PixelIsArea has half-open bounds: the right and bottom edges are
+		// outside, preventing an edge coordinate from becoming index width/height.
+		if i < -eps || j < -eps || i >= float64(g.imageWidth) || j >= float64(g.imageLength) {
+			return 0, fmt.Errorf("requested point %s lies outside the raster", (Point{Lon: x, Lat: y}))
+		}
+	}
+	if i < 0 {
+		i = 0
+	}
+	if j < 0 {
+		j = 0
+	}
+
+	if interp {
+		ci, cj := i, j
+		if !g.pixelIsPoint {
+			ci -= 0.5
+			cj -= 0.5
+		}
+		return g.interpolateRaster(ci, cj)
+	}
+
+	var px, py int
+	if g.pixelIsPoint {
+		px, py = int(math.Round(i)), int(math.Round(j))
+	} else {
+		px, py = int(math.Floor(i)), int(math.Floor(j))
+	}
+	if px >= int(g.imageWidth) {
+		px = int(g.imageWidth) - 1
+	}
+	if py >= int(g.imageLength) {
+		py = int(g.imageLength) - 1
+	}
+	return g.loc(px, py)
+}
+
+// interpolateRaster performs true bilinear interpolation between adjacent
+// sample centres. At the outermost half-cell it extends the nearest edge value.
+// NoData and NaN samples are omitted and remaining weights are renormalized.
+func (g *GeoTIFF) interpolateRaster(x, y float64) (float32, error) {
+	if g.imageWidth == 0 || g.imageLength == 0 {
+		return 0, errors.New("image dimensions are zero")
+	}
+	maxX, maxY := float64(g.imageWidth-1), float64(g.imageLength-1)
+	if x < 0 {
+		x = 0
+	}
+	if x > maxX {
+		x = maxX
+	}
+	if y < 0 {
+		y = 0
+	}
+	if y > maxY {
+		y = maxY
+	}
+	x0, y0 := int(math.Floor(x)), int(math.Floor(y))
+	x1, y1 := x0+1, y0+1
+	if x1 >= int(g.imageWidth) {
+		x1 = int(g.imageWidth) - 1
+	}
+	if y1 >= int(g.imageLength) {
+		y1 = int(g.imageLength) - 1
+	}
+	tx, ty := x-float64(x0), y-float64(y0)
+	coords := [4][2]int{{x0, y0}, {x1, y0}, {x0, y1}, {x1, y1}}
+	weights := [4]float64{(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty}
+	var weighted, totalWeight float64
+	for k, coord := range coords {
+		if weights[k] == 0 {
+			continue
+		}
+		v, err := g.loc(coord[0], coord[1])
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
-
-		for _, f := range [...]Tag{ImageLength, ImageWidth, RowsPerStrip} {
-			vals, ferr := tagUint32Slice(gTags, f)
-			if ferr != nil {
-				return nil, ferr
-			}
-			switch f {
-			case ImageWidth:
-				imageWidth = uint16(vals[0])
-			case ImageLength:
-				imageLength = uint16(vals[0])
-			case RowsPerStrip:
-				tileLen = uint16(vals[0])
-			}
+		if g.isNoData(v) || math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			continue
 		}
-		// For striped files, set effective tile width to imageWidth so that
-		// loc() works without modification.
-		tileW = imageWidth
+		weighted += float64(v) * weights[k]
+		totalWeight += weights[k]
 	}
+	if totalWeight == 0 {
+		return 0, errors.New("cannot interpolate: all surrounding samples are NoData")
+	}
+	return float32(weighted / totalWeight), nil
+}
 
-	pixelScale := gTags[ModelPixelScale]
-	pixelScaleLen := 3
-	if int(pixelScale.length) != pixelScaleLen {
-		return nil, fmt.Errorf("%s has invalid length %d", ModelPixelScale, pixelScale.length)
+// AtPoints returns image values for a sequence of model-coordinate points.
+func (g *GeoTIFF) AtPoints(points []Point, interp bool) ([]float32, error) {
+	values := make([]float32, len(points))
+	for i, p := range points {
+		v, err := g.AtCoord(p.Lon, p.Lat, interp)
+		if err != nil {
+			return nil, fmt.Errorf("point %d (%s): %w", i, p, err)
+		}
+		values[i] = v
 	}
-	var pixelScaleValues []float64
-	f, e := pixelScale.value()
-	switch f {
-	case DOUBLE:
-		pixelScaleValues = e[0].([]float64)
-	default:
-		return nil, fmt.Errorf("unrecognized value for %s", ModelPixelScale)
-	}
+	return values, nil
+}
 
-	return &GeoTIFF{
-		tags:        gTags,
-		data:        gData,
-		imageWidth:  imageWidth,
-		imageLength: imageLength,
-		tileWidth:   tileW,
-		tileLength:  tileLen,
-		PixelScaleX: pixelScaleValues[0],
-		PixelScaleY: pixelScaleValues[1],
+// loc returns a sample by integer column and row, independent of storage type.
+func (g *GeoTIFF) loc(x, y int) (float32, error) {
+	if x < 0 || x >= int(g.imageWidth) || y < 0 || y >= int(g.imageLength) {
+		return 0, errors.New("point lies outside image")
+	}
+	if g.tileWidth == 0 || g.tileLength == 0 {
+		return 0, errors.New("invalid zero tile dimensions")
+	}
+	tilesAcross := (uint64(g.imageWidth) + uint64(g.tileWidth) - 1) / uint64(g.tileWidth)
+	idAcross, idDown := uint64(x)/uint64(g.tileWidth), uint64(y)/uint64(g.tileLength)
+	tileNum := tilesAcross*idDown + idAcross
+	localX := uint64(x) % uint64(g.tileWidth)
+	localY := uint64(y) % uint64(g.tileLength)
+	index := localY*uint64(g.tileWidth) + localX
+	if tileNum >= uint64(len(g.data)) {
+		return 0, fmt.Errorf("missing data block %d", tileNum)
+	}
+	if index >= uint64(len(g.data[tileNum])) {
+		return 0, fmt.Errorf("sample index %d is outside data block %d", index, tileNum)
+	}
+	return g.data[tileNum][index], nil
+}
+
+// Bounds returns the four transformed raster corners. For rotated rasters
+// these are the actual corners, not an axis-aligned bounding-box rectangle.
+func (g *GeoTIFF) Bounds() (*CornerCoordinates, error) {
+	if g.imageWidth == 0 || g.imageLength == 0 {
+		return nil, errors.New("image dimensions are zero")
+	}
+	if err := g.ensureAffine(); err != nil {
+		return nil, err
+	}
+	var right, bottom float64
+	if g.pixelIsPoint {
+		right, bottom = float64(g.imageWidth-1), float64(g.imageLength-1)
+	} else {
+		right, bottom = float64(g.imageWidth), float64(g.imageLength)
+	}
+	ulx, uly := g.rasterToModel(0, 0)
+	urx, ury := g.rasterToModel(right, 0)
+	llx, lly := g.rasterToModel(0, bottom)
+	lrx, lry := g.rasterToModel(right, bottom)
+	return &CornerCoordinates{
+		UpperLeft: Point{Lon: ulx, Lat: uly}, UpperRight: Point{Lon: urx, Lat: ury},
+		LowerLeft: Point{Lon: llx, Lat: lly}, LowerRight: Point{Lon: lrx, Lat: lry},
 	}, nil
 }
 
-// New creates a new instance of a geotiff object
-//
-// # This constructor is primarily used for testing
-//
-// This constructor does not verify what tags have been included
-func New(data [][]float32, iWidth uint16, iLength uint16, tWidth uint16, tLength uint16, pX float64, pY float64, tags Tags) (*GeoTIFF, error) {
-	if pX < 0 || pY < 0 {
-		return nil, errors.New("pixel scale tags should be > 0")
+// Point contains model X and Y coordinates. Lon/Lat field names are retained
+// for compatibility; values need not be geographic degrees.
+type Point struct{ Lon, Lat float64 }
+
+func (p Point) String() string        { return fmt.Sprintf("%011.7f,  %011.7f", p.Lon, p.Lat) }
+func (p *Point) Equals(px Point) bool { return p.Lon == px.Lon && p.Lat == px.Lat }
+
+// Distance returns the haversine distance in metres. It is meaningful only
+// when both points are longitude/latitude coordinates in degrees.
+func (p *Point) Distance(px Point) float64 {
+	const earthRadiusInMetres = 6371008.8
+	toRadians := func(deg float64) float64 { return math.Pi * deg / 180 }
+	lat1, lat2 := toRadians(p.Lat), toRadians(px.Lat)
+	dLat, dLon := lat2-lat1, toRadians(px.Lon-p.Lon)
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1)*math.Cos(lat2)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return 2 * earthRadiusInMetres * math.Asin(math.Sqrt(a))
+}
+
+// CornerCoordinates contains the transformed raster corners.
+type CornerCoordinates struct{ UpperLeft, LowerLeft, UpperRight, LowerRight Point }
+
+// Contains tests the axis-aligned envelope of the four corners. For a rotated
+// raster this is only a coarse test; AtCoord performs the exact inverse test.
+func (cc CornerCoordinates) Contains(p Point) bool {
+	minX, maxX := math.Inf(1), math.Inf(-1)
+	minY, maxY := math.Inf(1), math.Inf(-1)
+	for _, q := range []Point{cc.UpperLeft, cc.UpperRight, cc.LowerLeft, cc.LowerRight} {
+		minX = math.Min(minX, q.Lon)
+		maxX = math.Max(maxX, q.Lon)
+		minY = math.Min(minY, q.Lat)
+		maxY = math.Max(maxY, q.Lat)
+	}
+	return p.Lon >= minX && p.Lon <= maxX && p.Lat >= minY && p.Lat <= maxY
+}
+
+func (cc CornerCoordinates) String() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Upper Left   ( %s )\n", cc.UpperLeft)
+	fmt.Fprintf(&sb, "Lower Left   ( %s )\n", cc.LowerLeft)
+	fmt.Fprintf(&sb, "Upper Right  ( %s )\n", cc.UpperRight)
+	fmt.Fprintf(&sb, "Lower Right  ( %s )\n", cc.LowerRight)
+	return sb.String()
+}
+
+func (g *GeoTIFF) noDataValue() (float32, bool) {
+	v, ok := g.tags[GDALNoData]
+	if !ok || v.fType != ASCII {
+		return 0, false
+	}
+	s := strings.TrimSpace(strings.TrimRight(v.asciiData, "\x00"))
+	parsed, err := strconv.ParseFloat(s, 32)
+	if err != nil {
+		return 0, false
+	}
+	return float32(parsed), true
+}
+
+func (g *GeoTIFF) isNoData(v float32) bool {
+	nd, ok := g.noDataValue()
+	if !ok {
+		return false
+	}
+	if math.IsNaN(float64(nd)) {
+		return math.IsNaN(float64(v))
+	}
+	return v == nd
+}
+
+// Read parses a classic GeoTIFF containing one uncompressed Float32 band.
+func Read(r io.ReadSeeker) (*GeoTIFF, error) {
+	ifds, header, err := readTags(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(ifds) == 0 {
+		return nil, errors.New("TIFF contains no image file directory")
+	}
+	// This implementation intentionally reads the first IFD only.
+	tags := ifds[0].Tags
+	if err := validateRasterLayout(tags); err != nil {
+		return nil, err
+	}
+	imageWidth, err := oneTagUint32(tags, ImageWidth, 0)
+	if err != nil {
+		return nil, err
+	}
+	imageLength, err := oneTagUint32(tags, ImageLength, 0)
+	if err != nil {
+		return nil, err
+	}
+	if imageWidth == 0 || imageLength == 0 {
+		return nil, errors.New("image dimensions must be greater than zero")
 	}
 
-	tilesAcross := (iWidth + tWidth - 1) / tWidth
-	tilesDown := (iLength + tLength - 1) / tLength
-	tilesPerImage := tilesAcross * tilesDown
-
-	if int(tilesPerImage) != len(data) {
-		return nil, errors.New("invalid number of tiles for data")
+	g := &GeoTIFF{tags: tags, imageWidth: imageWidth, imageLength: imageLength}
+	_, hasTileWidth := tags[TileWidth]
+	_, hasTileLength := tags[TileLength]
+	if hasTileWidth != hasTileLength {
+		return nil, errors.New("TIFF must contain both TileWidth and TileLength")
 	}
-
-	for _, d := range data {
-		if len(d) != int(tWidth*tLength) {
-			return nil, errors.New("invalid amount of tile data passed")
+	if hasTileWidth {
+		g.data, err = readData(r, tags, header)
+		if err != nil {
+			return nil, err
+		}
+		g.tileWidth, err = oneTagUint32(tags, TileWidth, 0)
+		if err != nil {
+			return nil, err
+		}
+		g.tileLength, err = oneTagUint32(tags, TileLength, 0)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		g.data, err = readStripData(r, tags, header)
+		if err != nil {
+			return nil, err
+		}
+		g.tileWidth = imageWidth
+		g.tileLength, err = oneTagUint32(tags, RowsPerStrip, math.MaxUint32)
+		if err != nil {
+			return nil, err
+		}
+		if g.tileLength > imageLength {
+			g.tileLength = imageLength
 		}
 	}
-
-	g := &GeoTIFF{}
-	g.data = data
-	g.imageWidth = iWidth
-	g.imageLength = iLength
-	g.tileWidth = tWidth
-	g.tileLength = tLength
-	g.PixelScaleX = pX
-	g.PixelScaleY = pY
-	g.tags = tags
+	if err := g.ensureAffine(); err != nil {
+		return nil, fmt.Errorf("invalid GeoTIFF georeferencing: %w", err)
+	}
 	return g, nil
 }
 
-// Contains the geotiff statistics
-type GeoTIFFStats struct {
-	Min    float32 // Min value in the image
-	Max    float32 // Max value in the image
-	Mean   float32 // Mean value in the image
-	StdDev float32 // Standard deviation of the image
-}
-
-func (gs GeoTIFFStats) String() string {
-	// Only print to 3 decimal places
-	return fmt.Sprintf("Minimum=%.3f, Maximum=%.3f, Mean=%.3f, StdDev=%.3f", gs.Min, gs.Max, gs.Mean, gs.StdDev)
-}
-
-// Stats returns the statistics of the geotiff
-// including the min, max, mean and standard deviation.
-func (g *GeoTIFF) Stats() GeoTIFFStats {
-
-	var minVal float32 = math.MaxFloat32
-	var maxVal float32 = math.SmallestNonzeroFloat32
-	var sum float32
-	var mean float32
-	var sumQ float32
-	var stdDev float32
-	var nonzero float32 = 0
-
-	for i := 0; i < len(g.data); i++ {
-		for j := 0; j < len(g.data[i]); j++ {
-			d := g.data[i][j]
-			if d != 0 {
-				nonzero++
-				sum += d
-				sumQ += d * d
-				if d < minVal {
-					minVal = d
-				}
-				if d > maxVal {
-					maxVal = d
-				}
+// New creates a GeoTIFF in memory. Each supplied tile must contain the full
+// tileWidth*tileLength samples, including padding beyond image edges.
+func New(data [][]float32, imageWidth, imageLength, tileWidth, tileLength uint32, pixelScaleX, pixelScaleY float64, tags Tags) (*GeoTIFF, error) {
+	if imageWidth == 0 || imageLength == 0 || tileWidth == 0 || tileLength == 0 {
+		return nil, errors.New("image and tile dimensions must be greater than zero")
+	}
+	if pixelScaleX <= 0 || pixelScaleY <= 0 || math.IsNaN(pixelScaleX) || math.IsNaN(pixelScaleY) || math.IsInf(pixelScaleX, 0) || math.IsInf(pixelScaleY, 0) {
+		return nil, errors.New("pixel scale values must be finite and greater than zero")
+	}
+	tilesAcross := (uint64(imageWidth) + uint64(tileWidth) - 1) / uint64(tileWidth)
+	tilesDown := (uint64(imageLength) + uint64(tileLength) - 1) / uint64(tileLength)
+	tilesPerImage := tilesAcross * tilesDown
+	if tilesPerImage != uint64(len(data)) {
+		return nil, errors.New("invalid number of tiles for data")
+	}
+	expected := uint64(tileWidth) * uint64(tileLength)
+	for i, tile := range data {
+		if uint64(len(tile)) != expected {
+			return nil, fmt.Errorf("tile %d has %d samples; expected %d", i, len(tile), expected)
+		}
+	}
+	if tags == nil {
+		tags = make(Tags)
+	}
+	g := &GeoTIFF{
+		data: data, imageWidth: imageWidth, imageLength: imageLength,
+		tileWidth: tileWidth, tileLength: tileLength,
+		PixelScaleX: pixelScaleX, PixelScaleY: pixelScaleY, tags: tags,
+	}
+	if err := g.setRasterType(); err != nil {
+		return nil, err
+	}
+	// A New-created object may be useful for pixel-only operations without
+	// georeferencing tags; Bounds/AtCoord will then return a clear error.
+	if _, ok := tags[ModelTransformation]; ok {
+		if err := g.ensureAffine(); err != nil {
+			return nil, err
+		}
+	} else if _, hasScale := tags[ModelPixelScale]; hasScale {
+		if _, hasTie := tags[ModelTiepoint]; hasTie {
+			if err := g.ensureAffine(); err != nil {
+				return nil, err
 			}
 		}
 	}
-	mean = sum / nonzero
-	stdDev = float32(math.Sqrt(float64(sumQ/nonzero - mean*mean)))
+	return g, nil
+}
 
-	return GeoTIFFStats{
-		Min:    minVal,
-		Max:    maxVal,
-		Mean:   mean,
-		StdDev: stdDev,
+// GeoTIFFStats contains summary statistics for valid image samples.
+type GeoTIFFStats struct {
+	Min    float32
+	Max    float32
+	Mean   float32
+	StdDev float32
+	Count  uint64
+}
+
+func (gs GeoTIFFStats) String() string {
+	return fmt.Sprintf("Minimum=%.3f, Maximum=%.3f, Mean=%.3f, StdDev=%.3f", gs.Min, gs.Max, gs.Mean, gs.StdDev)
+}
+
+// Stats computes population statistics over actual image pixels. Zero is a
+// valid value; GDAL_NODATA and non-finite samples are excluded. Padded pixels
+// in the final tile are not included.
+func (g *GeoTIFF) Stats() GeoTIFFStats {
+	stats := GeoTIFFStats{Min: float32(math.Inf(1)), Max: float32(math.Inf(-1))}
+	var mean, m2 float64
+	for y := 0; y < int(g.imageLength); y++ {
+		for x := 0; x < int(g.imageWidth); x++ {
+			v, err := g.loc(x, y)
+			if err != nil || g.isNoData(v) || math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+				continue
+			}
+			value := float64(v)
+			if stats.Count == 0 || v < stats.Min {
+				stats.Min = v
+			}
+			if stats.Count == 0 || v > stats.Max {
+				stats.Max = v
+			}
+			stats.Count++
+			delta := value - mean
+			mean += delta / float64(stats.Count)
+			m2 += delta * (value - mean)
+		}
 	}
+	if stats.Count == 0 {
+		nan := float32(math.NaN())
+		stats.Min, stats.Max, stats.Mean, stats.StdDev = nan, nan, nan, nan
+		return stats
+	}
+	stats.Mean = float32(mean)
+	stats.StdDev = float32(math.Sqrt(m2 / float64(stats.Count)))
+	return stats
 }
