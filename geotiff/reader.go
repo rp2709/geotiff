@@ -215,14 +215,20 @@ func (t tagData) value() (fieldType, []interface{}) {
 	return NONE, nil
 }
 
+type IFD struct {
+	Offset     uint32
+	NextOffset int64
+	Tags       Tags
+}
+
 // readTags reads the tags of a GeoTIFF file
-func readTags(r io.ReadSeeker) (Tags, head, error) {
-	tags := make(Tags)
+func readTags(r io.ReadSeeker) ([]IFD, head, error) {
+	ifds := make([]IFD, 0)
 
 	// read the header tag to extract the IFD Byte offset
 	h, err := readHeader(r)
 	if err != nil {
-		return tags, h, fmt.Errorf("failed to read tiff header: %w", err)
+		return ifds, h, fmt.Errorf("failed to read tiff header: %w", err)
 	}
 
 	// Get the first IFD entry via the IFD Byte offset recorded in the header
@@ -240,9 +246,14 @@ func readTags(r io.ReadSeeker) (Tags, head, error) {
 	iFDOffset := h.iFDByteOffset
 
 	for iFDOffset != 0 {
+		currentIFD := IFD{
+			Offset: iFDOffset,
+			Tags:   make(Tags),
+		}
+
 		// Jump to the IFD Byte Offset
 		if _, err := r.Seek(int64(iFDOffset), io.SeekStart); err != nil {
-			return tags, h, fmt.Errorf("error: unable to seek to start of IFD at %d", iFDOffset)
+			return ifds, h, fmt.Errorf("error: unable to seek to start of IFD at %d", iFDOffset)
 		}
 
 		// Per the TIFF 6.0 Specification (p.14)
@@ -251,21 +262,21 @@ func readTags(r io.ReadSeeker) (Tags, head, error) {
 		// first two bytes of each IFD
 		var numDirectoryEntries uint16
 		if err := binary.Read(r, h.byteOrder, &numDirectoryEntries); err != nil {
-			return tags, h, errors.New("error: unable to read directory entry")
+			return ifds, h, errors.New("error: unable to read directory entry")
 		}
 		var nextDirOffset int64
 		for i := uint16(0); i < numDirectoryEntries; i++ {
 
 			var iFDEntry iFDEntry
 			if err := binary.Read(r, h.byteOrder, &iFDEntry); err != nil {
-				return tags, h, err
+				return ifds, h, err
 			}
 
 			if iFDEntry.FType.bytes() == 0 {
-				return tags, h, fmt.Errorf("error: unrecognized tag %d", iFDEntry.Tag)
+				return ifds, h, fmt.Errorf("error: unrecognized tag %d", iFDEntry.Tag)
 			}
 
-			// Per  the TIFF 6.0 Specification
+			// Per the TIFF 6.0 Specification
 			//
 			// If the Value is shorter than 4 bytes, it is left-justified
 			// within the 4-byte Value Offset, i.e., stored in the
@@ -284,21 +295,25 @@ func readTags(r io.ReadSeeker) (Tags, head, error) {
 			tagName := iFDEntry.Tag
 			tagvalue, err := iFDEntry.value(r, h.byteOrder)
 			if err != nil {
-				return tags, h, err
+				return ifds, h, err
 			}
-			tags[tagName] = *tagvalue
+			currentIFD.Tags[tagName] = *tagvalue
 
 			// Jump to the next directory entry
 			if _, err := r.Seek(nextDirOffset, io.SeekStart); err != nil {
-				return tags, h, fmt.Errorf("err: could not jump to next directory: %w", err)
+				return ifds, h, fmt.Errorf("err: could not jump to next directory: %w", err)
 			}
+
+			currentIFD.NextOffset = nextDirOffset
+
+			ifds = append(ifds, currentIFD)
 		}
 
 		if err = binary.Read(r, h.byteOrder, &iFDOffset); err != nil {
-			return tags, h, fmt.Errorf("err: could not jump to next file: %w", err)
+			return ifds, h, fmt.Errorf("err: could not jump to next file: %w", err)
 		}
 	}
-	return tags, h, nil
+	return ifds, h, nil
 }
 
 var errGeoTIFFData = errors.New("could not read GeoTIFF data")
@@ -712,10 +727,13 @@ func (cc CornerCoordinates) String() string {
 // files the effective tile dimensions are set to (imageWidth, rowsPerStrip) so
 // that the existing loc() arithmetic works without modification.
 func Read(r io.ReadSeeker) (*GeoTIFF, error) {
-	gTags, header, err := readTags(r)
+	gIfds, header, err := readTags(r)
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO : use multiple ifds if available. For now, we just take the first one
+	gTags := gIfds[0].Tags
 
 	var (
 		gData                                   [][]float32

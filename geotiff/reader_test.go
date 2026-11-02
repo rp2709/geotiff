@@ -131,10 +131,12 @@ func Test_ReadTags_Happy(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		gotTags, _, err := readTags(r)
+		ifds, _, err := readTags(r)
+
 		if err != nil {
 			t.Fatalf("error %s", err)
 		}
+		gotTags := ifds[0].Tags
 
 		for k, v := range tt.expectedTags {
 			gotV, ok := gotTags[k]
@@ -183,10 +185,11 @@ func Test_ReadData_Happy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tt, h, err := readTags(r)
+	ifds, h, err := readTags(r)
 	if err != nil {
 		t.Fatal(err)
 	}
+	tt := ifds[0].Tags
 	data, err := readData(r, tt, h)
 	if err != nil {
 		t.Fatal(err)
@@ -555,56 +558,66 @@ func makeTestStripTIFF(t *testing.T) []byte {
 	const (
 		imgWidth      = 4
 		imgHeight     = 6
-		rps           = 2 // RowsPerStrip
+		rps           = 2                           // RowsPerStrip
 		numStrips     = (imgHeight + rps - 1) / rps // = 3 (ceiling division)
-		bytesPerStrip = imgWidth * rps * 4           // float32 = 4 bytes each
+		bytesPerStrip = imgWidth * rps * 4          // float32 = 4 bytes each
 	)
 
 	// Byte offsets for each section of the file.
 	const (
-		ifdStart            = 8
-		numIFDEntries       = 13
-		ifdSize             = 2 + numIFDEntries*12 + 4 // 162
-		stripOffsetsOff     = ifdStart + ifdSize        // 170
-		stripByteCountsOff  = stripOffsetsOff + numStrips*4  // 182
-		pixelScaleOff       = stripByteCountsOff + numStrips*4 // 194
-		tiepointOff         = pixelScaleOff + 3*8             // 218
-		imageDataOff        = tiepointOff + 6*8               // 266
+		ifdStart           = 8
+		numIFDEntries      = 13
+		ifdSize            = 2 + numIFDEntries*12 + 4         // 162
+		stripOffsetsOff    = ifdStart + ifdSize               // 170
+		stripByteCountsOff = stripOffsetsOff + numStrips*4    // 182
+		pixelScaleOff      = stripByteCountsOff + numStrips*4 // 194
+		tiepointOff        = pixelScaleOff + 3*8              // 218
+		imageDataOff       = tiepointOff + 6*8                // 266
 	)
 
 	// Header
-	w(uint16(0x4949))    // II = little-endian
-	w(uint16(42))        // TIFF magic
-	w(uint32(ifdStart))  // offset to first IFD
+	w(uint16(0x4949))   // II = little-endian
+	w(uint16(42))       // TIFF magic
+	w(uint32(ifdStart)) // offset to first IFD
 
 	// IFD entry count
 	w(uint16(numIFDEntries))
 
 	// Helpers to write individual IFD entries.
 	writeShort := func(tag, val uint16) {
-		w(tag); w(uint16(3)); w(uint32(1)); w(val); w(uint16(0))
+		w(tag)
+		w(uint16(3))
+		w(uint32(1))
+		w(val)
+		w(uint16(0))
 	}
 	writeLongOff := func(tag uint16, count, offset uint32) {
-		w(tag); w(uint16(4)); w(count); w(offset)
+		w(tag)
+		w(uint16(4))
+		w(count)
+		w(offset)
 	}
 	writeDoubleOff := func(tag uint16, count, offset uint32) {
-		w(tag); w(uint16(12)); w(count); w(offset)
+		w(tag)
+		w(uint16(12))
+		w(count)
+		w(offset)
 	}
 
 	// IFD entries – must be sorted in ascending tag order.
-	writeShort(256, imgWidth)                                       // ImageWidth
-	writeShort(257, imgHeight)                                      // ImageLength
-	writeShort(258, 32)                                             // BitsPerSample
-	writeShort(259, 1)                                              // Compression = none
-	writeShort(262, 1)                                              // PhotometricInterpretation
-	writeLongOff(273, numStrips, stripOffsetsOff)                   // StripOffsets
-	writeShort(277, 1)                                              // SamplesPerPixel
-	writeShort(278, rps)                                            // RowsPerStrip
-	writeLongOff(279, numStrips, stripByteCountsOff)                // StripByteCounts
-	writeShort(284, 1)                                              // PlanarConfiguration
-	writeShort(339, 3)                                              // SampleFormat = IEEE float
-	writeDoubleOff(33550, 3, pixelScaleOff)                         // ModelPixelScale
-	writeDoubleOff(33922, 6, tiepointOff)                           // ModelTiepoint
+	writeShort(256, imgWidth)                        // ImageWidth
+	writeShort(257, imgHeight)                       // ImageLength
+	writeShort(258, 32)                              // BitsPerSample
+	writeShort(259, 1)                               // Compression = none
+	writeShort(262, 1)                               // PhotometricInterpretation
+	writeLongOff(273, numStrips, stripOffsetsOff)    // StripOffsets
+	writeShort(277, 1)                               // SamplesPerPixel
+	writeShort(278, rps)                             // RowsPerStrip
+	writeLongOff(279, numStrips, stripByteCountsOff) // StripByteCounts
+	writeShort(284, 1)                               // PlanarConfiguration
+	writeShort(339, 3)                               // SampleFormat = IEEE float
+	writeDoubleOff(33550, 3, pixelScaleOff)          // ModelPixelScale
+	writeDoubleOff(33922, 6, tiepointOff)            // ModelTiepoint
 
 	w(uint32(0)) // next IFD = none
 
@@ -617,10 +630,16 @@ func makeTestStripTIFF(t *testing.T) []byte {
 		w(uint32(bytesPerStrip))
 	}
 	// ModelPixelScale: (scaleX, scaleY, scaleZ)
-	w(float64(0.1)); w(float64(0.1)); w(float64(0.0))
+	w(float64(0.1))
+	w(float64(0.1))
+	w(float64(0.0))
 	// ModelTiepoint: (I, J, K, X, Y, Z)  – upper-left pixel at (135.0, -20.0)
-	w(float64(0)); w(float64(0)); w(float64(0))
-	w(float64(135.0)); w(float64(-20.0)); w(float64(0))
+	w(float64(0))
+	w(float64(0))
+	w(float64(0))
+	w(float64(135.0))
+	w(float64(-20.0))
+	w(float64(0))
 
 	// Image data: float32 values 1 … 24 in row-major order
 	var v float32 = 1.0
@@ -636,10 +655,11 @@ func Test_ReadStripData_Happy(t *testing.T) {
 	data := makeTestStripTIFF(t)
 	r := bytes.NewReader(data)
 
-	tags, h, err := readTags(r)
+	ifds, h, err := readTags(r)
 	if err != nil {
 		t.Fatal(err)
 	}
+	tags := ifds[0].Tags
 
 	strips, err := readStripData(r, tags, h)
 	if err != nil {
@@ -692,11 +712,11 @@ func Test_Read_StripFormat_Happy(t *testing.T) {
 		x, y int
 		want float32
 	}{
-		{0, 0, 1.0},   // row 0, col 0
-		{3, 1, 8.0},   // row 1, col 3
-		{2, 2, 11.0},  // row 2, col 2
-		{1, 4, 18.0},  // row 4, col 1
-		{3, 5, 24.0},  // row 5, col 3
+		{0, 0, 1.0},  // row 0, col 0
+		{3, 1, 8.0},  // row 1, col 3
+		{2, 2, 11.0}, // row 2, col 2
+		{1, 4, 18.0}, // row 4, col 1
+		{3, 5, 24.0}, // row 5, col 3
 	}
 
 	for _, tt := range tests {
@@ -765,9 +785,9 @@ func makeTestStripTIFFLongDims(t *testing.T) []byte {
 	const (
 		imgWidth      = 4
 		imgHeight     = 6
-		rps           = 2 // RowsPerStrip
+		rps           = 2                           // RowsPerStrip
 		numStrips     = (imgHeight + rps - 1) / rps // = 3
-		bytesPerStrip = imgWidth * rps * 4           // float32 = 4 bytes
+		bytesPerStrip = imgWidth * rps * 4          // float32 = 4 bytes
 	)
 
 	// Byte offsets for each section of the file.
@@ -778,7 +798,7 @@ func makeTestStripTIFFLongDims(t *testing.T) []byte {
 		ifdStart           = 8
 		numIFDEntries      = 13
 		ifdSize            = 2 + numIFDEntries*12 + 4 // 162
-		stripOffsetsOff    = ifdStart + ifdSize        // 170
+		stripOffsetsOff    = ifdStart + ifdSize       // 170
 		stripByteCountsOff = stripOffsetsOff + numStrips*4
 		pixelScaleOff      = stripByteCountsOff + numStrips*4
 		tiepointOff        = pixelScaleOff + 3*8
@@ -796,23 +816,32 @@ func makeTestStripTIFFLongDims(t *testing.T) []byte {
 	// writeLong writes a single-value LONG IFD entry whose value fits in the
 	// 4-byte value-offset field (TIFF spec: values ≤ 4 bytes are stored inline).
 	writeLong := func(tag uint16, val uint32) {
-		w(tag); w(uint16(4)); w(uint32(1)); w(val)
+		w(tag)
+		w(uint16(4))
+		w(uint32(1))
+		w(val)
 	}
 	writeLongOff := func(tag uint16, count, offset uint32) {
-		w(tag); w(uint16(4)); w(count); w(offset)
+		w(tag)
+		w(uint16(4))
+		w(count)
+		w(offset)
 	}
 	writeDoubleOff := func(tag uint16, count, offset uint32) {
-		w(tag); w(uint16(12)); w(count); w(offset)
+		w(tag)
+		w(uint16(12))
+		w(count)
+		w(offset)
 	}
 
 	// IFD entries – must be in ascending tag order.
 	// Dimension/sample fields use LONG instead of SHORT to exercise the
 	// SHORT/LONG-agnostic reading path introduced for NRW DGM1 support.
-	writeLong(256, imgWidth)  // ImageWidth      – LONG
-	writeLong(257, imgHeight) // ImageLength     – LONG
-	writeLong(258, 32)        // BitsPerSample   – LONG
-	writeLong(259, 1)         // Compression     – LONG (none)
-	writeLong(262, 1)         // PhotometricInterpretation – LONG
+	writeLong(256, imgWidth)                         // ImageWidth      – LONG
+	writeLong(257, imgHeight)                        // ImageLength     – LONG
+	writeLong(258, 32)                               // BitsPerSample   – LONG
+	writeLong(259, 1)                                // Compression     – LONG (none)
+	writeLong(262, 1)                                // PhotometricInterpretation – LONG
 	writeLongOff(273, numStrips, stripOffsetsOff)    // StripOffsets
 	writeLong(277, 1)                                // SamplesPerPixel – LONG
 	writeLong(278, rps)                              // RowsPerStrip    – LONG
@@ -833,10 +862,16 @@ func makeTestStripTIFFLongDims(t *testing.T) []byte {
 		w(uint32(bytesPerStrip))
 	}
 	// ModelPixelScale: (scaleX, scaleY, scaleZ)
-	w(float64(0.1)); w(float64(0.1)); w(float64(0.0))
+	w(float64(0.1))
+	w(float64(0.1))
+	w(float64(0.0))
 	// ModelTiepoint: (I, J, K, X, Y, Z) – upper-left pixel at (135.0, -20.0)
-	w(float64(0)); w(float64(0)); w(float64(0))
-	w(float64(135.0)); w(float64(-20.0)); w(float64(0))
+	w(float64(0))
+	w(float64(0))
+	w(float64(0))
+	w(float64(135.0))
+	w(float64(-20.0))
+	w(float64(0))
 
 	// Image data: float32 values 1 … 24 in row-major order
 	var v float32 = 1.0
@@ -891,10 +926,11 @@ func Test_ReadStripData_LongDims(t *testing.T) {
 	data := makeTestStripTIFFLongDims(t)
 	r := bytes.NewReader(data)
 
-	tags, h, err := readTags(r)
+	ifds, h, err := readTags(r)
 	if err != nil {
 		t.Fatal(err)
 	}
+	tags := ifds[0].Tags
 
 	strips, err := readStripData(r, tags, h)
 	if err != nil {
